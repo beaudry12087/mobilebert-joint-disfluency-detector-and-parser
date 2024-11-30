@@ -185,14 +185,11 @@ class ScaledDotProductAttention(nn.Module):
                     'Attention mask shape {} mismatch ' \
                     'with Attention logit tensor shape ' \
                     '{}.'.format(attn_mask.size(), attn.size())
-
-            attn.data.masked_fill_(attn_mask, -float('inf'))
+            
+            # Convert mask to boolean type before using masked_fill_
+            attn.data.masked_fill_(attn_mask.bool(), -float('inf'))
 
         attn = self.softmax(attn)
-        # Note that this makes the distribution not sum to 1. At some point it
-        # may be worth researching whether this is the right way to apply
-        # dropout to the attention.
-        # Note that the t2t code also applies dropout in this manner
         attn = self.dropout(attn)
         output = torch.bmm(attn, v)
 
@@ -1018,7 +1015,7 @@ class NKChartParser(nn.Module):
             features = all_encoder_layers[-1]
 
             if self.encoder is not None:
-                features_packed = features.masked_select(all_word_end_mask.to(torch.uint8).unsqueeze(-1)).reshape(-1, features.shape[-1])
+                features_packed = features.masked_select(all_word_end_mask.bool().unsqueeze(-1)).reshape(-1, features.shape[-1])
 
                 # For now, just project the features from the last word piece in each word
                 extra_content_annotations = self.project_bert(features_packed)
@@ -1047,8 +1044,8 @@ class NKChartParser(nn.Module):
         else:
             assert self.bert is not None
             features = self.project_bert(features)
-            fencepost_annotations_start = features.masked_select(all_word_start_mask.to(torch.uint8).unsqueeze(-1)).reshape(-1, features.shape[-1])
-            fencepost_annotations_end = features.masked_select(all_word_end_mask.to(torch.uint8).unsqueeze(-1)).reshape(-1, features.shape[-1])
+            fencepost_annotations_start = features.masked_select(all_word_start_mask.bool().unsqueeze(-1)).reshape(-1, features.shape[-1])
+            fencepost_annotations_end = features.masked_select(all_word_end_mask.bool().unsqueeze(-1)).reshape(-1, features.shape[-1])
             if self.f_tag is not None:
                 tag_annotations = fencepost_annotations_end
 

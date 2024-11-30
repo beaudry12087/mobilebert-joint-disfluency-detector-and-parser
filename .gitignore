@@ -3,3 +3,7 @@ mj-models
 EVALB/evalb
 data/elmo_2x4096_512_2048cnn_2xhighway_options.json
 data/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5
+best_models/swbd_fisher_bert_Edev.0.9078.pt
+model/bert-base-uncased-vocab.txt
+model/bert-base-uncased.tar.gz
+model/pytorch_model.bin

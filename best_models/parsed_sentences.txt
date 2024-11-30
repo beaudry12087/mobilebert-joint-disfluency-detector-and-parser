@@ -1,0 +1,2 @@
+(S (EDITED (S (NP (UNK we)) (VP (UNK do) (UNK n't)))) (INTJ (UNK uh)) (PRN (S (NP (UNK i)) (VP (UNK mean)))) (NP (NP (UNK a) (UNK lot)) (PP (UNK of) (NP (UNK states)))) (VP (UNK do) (UNK n't) (VP (UNK have) (NP (UNK special) (UNK punishment)))))
+(S (INTJ (UNK no)) (EDITED (EDITED (NP (UNK i))) (S (NP (UNK i)) (VP (UNK ca) (UNK n't)))) (INTJ (UNK uh)) (INTJ (UNK well)) (NP (UNK i)) (VP (UNK live) (PP (PP (UNK in) (INTJ (UNK uh)) (NP (NP (UNK richardson)) (NP (UNK texas)))) (UNK and) (INTJ (UNK uh)))))
