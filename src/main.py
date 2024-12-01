@@ -16,6 +16,8 @@ import nkutil
 import parse_nk
 tokens = parse_nk
 import evaluate_EDITED
+from tqdm import tqdm
+import wandb
 
 def torch_load(load_path):
     if parse_nk.use_cuda:
@@ -87,6 +89,7 @@ def make_hparams():
         bert_transliterate="",
         min_subbatch_size=4,
         max_subbatch_size=32,
+        evalb_dir="EVALB"
         )
 
 def run_train(args, hparams):
@@ -117,9 +120,17 @@ def run_train(args, hparams):
     gold_train_treebank = trees.load_trees(args.gold_train_path)
     silver_train_treebank = trees.load_trees(args.silver_train_path)
     
-    new_batch_size = int(args.batch_size * ((10-args.silver_weight)/10)) 
-    silver_batch_size = int(args.batch_size - new_batch_size)
-
+    if args.silver_weight == 0:
+        # Use only gold data
+        new_batch_size = args.batch_size
+        silver_batch_size = 0
+        silver_train_treebank = []
+        silver_train_parse = []
+    else:
+        # Use both gold and silver data
+        new_batch_size = int(args.batch_size * ((10-args.silver_weight)/10)) 
+        silver_batch_size = int(args.batch_size - new_batch_size)
+        
     if hparams.max_len_train > 0:
         gold_train_treebank = [tree for tree in gold_train_treebank if len(list(tree.leaves())) <= hparams.max_len_train]
         silver_train_treebank = [tree for tree in silver_train_treebank if len(list(tree.leaves())) <= hparams.max_len_train]
@@ -260,6 +271,7 @@ def run_train(args, hparams):
     best_dev_model_path = None
     best_dev_processed = 0
     best_dev_efscore = None
+    dev_efscore = None
 
     start_time = time.time()
 
@@ -332,14 +344,32 @@ def run_train(args, hparams):
         np.random.shuffle(silver_train_parse)
         epoch_start_time = time.time()
         silver_start_index = 0
-        for start_index in range(0, len(gold_train_parse), new_batch_size):
+        
+        # Calculate total batches
+        total_batches = len(gold_train_parse) // new_batch_size
+        
+        # Create tqdm progress bar
+        pbar = tqdm(range(0, len(gold_train_parse), new_batch_size), 
+                   total=total_batches,
+                   desc=f"Epoch {epoch}",
+                   unit='batch')
+        
+        epoch_loss = 0.0
+        epoch_batches = 0
+
+        for start_index in pbar:
             trainer.zero_grad()
             schedule_lr(total_processed // new_batch_size)
 
             batch_loss_value = 0.0
             gold_batch_trees = gold_train_parse[start_index:start_index + new_batch_size]
-            silver_batch_trees = silver_train_parse[silver_start_index*silver_batch_size:(silver_start_index*silver_batch_size) + silver_batch_size]
-            batch_trees = gold_batch_trees + silver_batch_trees
+            
+            # Only add silver trees if silver_weight > 0
+            if args.silver_weight > 0:
+                silver_batch_trees = silver_train_parse[silver_start_index*silver_batch_size:(silver_start_index*silver_batch_size) + silver_batch_size]
+                batch_trees = gold_batch_trees + silver_batch_trees
+            else:
+                batch_trees = gold_batch_trees
 
             # Sort batch by length before creating sentences
             batch_trees.sort(key=lambda tree: len(list(tree.leaves())), reverse=True)
@@ -394,11 +424,22 @@ def run_train(args, hparams):
             grad_norm = torch.nn.utils.clip_grad_norm_(clippable_parameters, grad_clip_threshold)
             trainer.step()
             
-            if current_processed >= check_every:
-                current_processed -= check_every
-                dev_efscore = check_dev()
-                   
-        assert dev_efscore, "dev_efscore unbound, is checks_per_epoch >= 1?"
+            # Update progress bar with loss
+            epoch_loss += batch_loss_value
+            epoch_batches += 1
+            pbar.set_postfix({
+                'loss': f'{batch_loss_value:.4f}',
+                'avg_loss': f'{epoch_loss/epoch_batches:.4f}'
+            })
+
+        # Print epoch summary
+        avg_loss = epoch_loss / max(1, epoch_batches)
+        print(f"\nEpoch {epoch} completed - avg loss: {avg_loss:.4f}, time: {format_elapsed(epoch_start_time)}")
+
+        # Add evaluation at the end of each epoch
+        dev_efscore = check_dev()
+        
+        assert dev_efscore, "dev_efscore is zero/empty. Check evaluation logic."
         print ("epoch {:,} " "total-processed {} " "current-processed {}" .format(epoch, total_processed, current_processed))
         if epoch == 1:
             check_hurdle(epoch, args.epoch1_hurdle)
