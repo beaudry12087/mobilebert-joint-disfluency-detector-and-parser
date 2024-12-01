@@ -93,6 +93,33 @@ def make_hparams():
         )
 
 def run_train(args, hparams):
+    # Initialize wandb with automatic config capture
+    wandb_config = {
+        # First, capture all hparams
+        **vars(hparams),
+        # Then capture all command line args
+        **vars(args),
+        # Add any additional fixed parameters
+        "architecture": "NKChartParser",
+        "dataset": "swbd"
+    }
+
+    # Initialize wandb with the config
+    wandb.init(
+        project="disfluency-detection-training",
+        config=wandb_config,
+        name=f"run_{time.strftime('%Y%m%d_%H%M%S')}",  # Add a unique name for each run
+        tags=[
+            "parser",
+            "disfluency",
+            "bert" if hparams.use_bert else "no-bert",
+            f"layers_{hparams.num_layers}",
+        ]
+    )
+
+    # Print captured config for verification
+    print("Wandb config:", wandb_config)
+
     if args.numpy_seed is not None:
         print("Setting numpy random seed to {}...".format(args.numpy_seed))
         np.random.seed(args.numpy_seed)
@@ -294,6 +321,26 @@ def run_train(args, hparams):
         dev_fscore = evaluate.evalb(args.evalb_dir, dev_treebank, dev_predicted)        
         dev_efscore = evaluate_EDITED.Evaluate(dev_treebank, dev_predicted)
 
+        # Log metrics with proper error handling
+        metrics = {
+            # Parsing metrics (from evalb)
+            "dev/parsing/fscore": float(dev_fscore.fscore),
+            "dev/parsing/recall": float(dev_fscore.recall),
+            "dev/parsing/precision": float(dev_fscore.precision),
+            
+            # EDITED metrics (assuming it returns a single score)
+            "dev/edited/score": float(dev_efscore.efscore),
+            
+            # Time metrics
+            "dev/elapsed_time": time.time() - dev_start_time,
+            "total_processed": total_processed
+        }
+
+        # Add debug print to verify values
+        print("Logging metrics:", metrics, flush=True)
+        
+        wandb.log(metrics)
+
         print(
             "dev-fscore {} "
             "dev_efscore {}"
@@ -345,14 +392,17 @@ def run_train(args, hparams):
         epoch_start_time = time.time()
         silver_start_index = 0
         
-        # Calculate total batches
-        total_batches = len(gold_train_parse) // new_batch_size
+        # Calculate total batches and samples
+        total_samples = len(gold_train_parse)
+        total_batches = (total_samples + new_batch_size - 1) // new_batch_size  # Ceiling division
         
-        # Create tqdm progress bar
+        # Create tqdm progress bar with more detailed metrics
         pbar = tqdm(range(0, len(gold_train_parse), new_batch_size), 
                    total=total_batches,
-                   desc=f"Epoch {epoch}",
-                   unit='batch')
+                   desc=f"Epoch {epoch}/{args.epochs if args.epochs else '∞'}",
+                   unit='batch',
+                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}, loss={postfix[0]:.4f}, avg_loss={postfix[1]:.4f}]',
+                   postfix=[0.0, 0.0])  # [current_loss, avg_loss]
         
         epoch_loss = 0.0
         epoch_batches = 0
@@ -424,17 +474,34 @@ def run_train(args, hparams):
             grad_norm = torch.nn.utils.clip_grad_norm_(clippable_parameters, grad_clip_threshold)
             trainer.step()
             
-            # Update progress bar with loss
+            # Update progress bar metrics
             epoch_loss += batch_loss_value
             epoch_batches += 1
-            pbar.set_postfix({
-                'loss': f'{batch_loss_value:.4f}',
-                'avg_loss': f'{epoch_loss/epoch_batches:.4f}'
+            avg_loss = epoch_loss / epoch_batches
+            pbar.postfix[0] = batch_loss_value  # Current loss
+            pbar.postfix[1] = avg_loss  # Average loss
+            pbar.refresh()
+
+            # Log training metrics for each batch
+            wandb.log({
+                "train/batch_loss": batch_loss_value,
+                "train/avg_loss": avg_loss,
+                "train/learning_rate": trainer.param_groups[0]['lr'],
+                "train/grad_norm": grad_norm,
+                "train/epoch": epoch,
+                "train/global_step": total_processed // new_batch_size,
+                "train/processed_examples": total_processed,
+                "train/batch": epoch_batches,
+                "train/samples_processed": start_index + len(gold_batch_trees)
             })
 
-        # Print epoch summary
-        avg_loss = epoch_loss / max(1, epoch_batches)
-        print(f"\nEpoch {epoch} completed - avg loss: {avg_loss:.4f}, time: {format_elapsed(epoch_start_time)}")
+        # Log epoch-level metrics
+        wandb.log({
+            "train/epoch": epoch,
+            "train/final_epoch_loss": epoch_loss / max(1, epoch_batches),
+            "train/epoch_time": time.time() - epoch_start_time,
+            "train/total_batches": epoch_batches
+        })
 
         # Add evaluation at the end of each epoch
         dev_efscore = check_dev()
@@ -461,9 +528,16 @@ def run_train(args, hparams):
     else:
         print(best_dev_efscore.table(), flush=True)
         
-
+    # Close wandb run when training completes
+    wandb.finish()
 
 def run_test(args):
+    # Initialize wandb in test mode
+    wandb.init(
+        project="disfluency-detection-training",
+        job_type="evaluation"
+    )
+
     print("Loading test trees from {}...".format(args.test_path))
     test_treebank = trees.load_trees(args.test_path)
     print("Loaded {:,} test examples.".format(len(test_treebank)))
@@ -508,6 +582,14 @@ def run_test(args):
             format_elapsed(start_time),
         )
     )
+
+    # Log test metrics
+    wandb.log({
+        "test/fscore": test_fscore,
+        "test/elapsed_time": time.time() - start_time
+    })
+
+    wandb.finish()
 
 #%%
 def run_ensemble(args):
