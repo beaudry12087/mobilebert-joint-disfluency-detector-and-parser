@@ -85,6 +85,8 @@ def make_hparams():
         bert_model="bert-base-uncased",
         bert_do_lower_case=True,
         bert_transliterate="",
+        min_subbatch_size=4,
+        max_subbatch_size=32,
         )
 
 def run_train(args, hparams):
@@ -170,8 +172,6 @@ def run_train(args, hparams):
                 word_vocab.index(node.word)
                 char_set |= set(node.word)
 
-
-
     char_vocab = vocabulary.Vocabulary()
 
     # If codepoints are small (e.g. Latin alphabet), index by codepoint directly
@@ -242,11 +242,8 @@ def run_train(args, hparams):
 
     warmup_coeff = hparams.learning_rate / hparams.learning_rate_warmup_steps
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        trainer, 'max',
-        factor=hparams.step_decay_factor,
-        patience=hparams.step_decay_patience,
-        verbose=True,
-    )
+        trainer, mode='max', factor=hparams.step_decay_factor,
+        patience=hparams.step_decay_patience, verbose=False)
     def schedule_lr(iteration):
         iteration = iteration + 1
         if iteration <= hparams.learning_rate_warmup_steps:
@@ -343,31 +340,60 @@ def run_train(args, hparams):
             gold_batch_trees = gold_train_parse[start_index:start_index + new_batch_size]
             silver_batch_trees = silver_train_parse[silver_start_index*silver_batch_size:(silver_start_index*silver_batch_size) + silver_batch_size]
             batch_trees = gold_batch_trees + silver_batch_trees
+
+            # Sort batch by length before creating sentences
+            batch_trees.sort(key=lambda tree: len(list(tree.leaves())), reverse=True)
             batch_sentences = [[(leaf.tag, leaf.word) for leaf in tree.leaves()] for tree in batch_trees]
-            batch_num_tokens = sum(len(sentence) for sentence in batch_sentences)
-            silver_start_index += 1
-            if (silver_start_index*silver_batch_size) + silver_batch_size > len(silver_train_parse)-silver_batch_size: silver_start_index = 0        
-            for subbatch_sentences, subbatch_trees in parser.split_batch(batch_sentences, batch_trees, args.subbatch_max_tokens):
-                _, loss = parser.parse_batch(subbatch_sentences, subbatch_trees)
 
-                if hparams.predict_tags:
-                    loss = loss[0] / len(batch_trees) + loss[1] / batch_num_tokens
-                else:
-                    loss = loss / len(batch_trees)
-                loss_value = float(loss.data.cpu().numpy())
-                batch_loss_value += loss_value
-                if loss_value > 0:
-                    loss.backward()
-                del loss
-                total_processed += len(subbatch_trees)
-                current_processed += len(subbatch_trees)
-                #print ("total-processed {} " "current-processed {}" .format(total_processed, current_processed))
+            # Group sentences of similar lengths together (bucketing)
+            length_groups = {}
+            for idx, sent in enumerate(batch_sentences):
+                length_key = len(sent)  # Group only exactly matching lengths
+                if length_key not in length_groups:
+                    length_groups[length_key] = []
+                length_groups[length_key].append((idx, sent))
+
+            try:
+                total_loss = 0
+                # Process each length group separately
+                for group_key in sorted(length_groups.keys(), reverse=True):
+                    group_indices, group_sentences = zip(*length_groups[group_key])
+                    group_trees = [batch_trees[idx] for idx in group_indices]
+                    
+                    # Process in smaller chunks if group is too large
+                    chunk_size = min(len(group_sentences), hparams.min_subbatch_size)
+                    for i in range(0, len(group_sentences), chunk_size):
+                        chunk_sentences = list(group_sentences[i:i + chunk_size])
+                        chunk_trees = group_trees[i:i + chunk_size]
+                        
+                        #print(f"Debug - Processing length {group_key} chunk:")
+                        #print(f"- Chunk size: {len(chunk_sentences)}")
+                        #print(f"- Sentence length: {len(chunk_sentences[0])}")
+                        
+                        _, loss = parser.parse_batch(chunk_sentences, chunk_trees)
+                        
+                        if hparams.predict_tags:
+                            loss = loss[0] / len(chunk_trees) + loss[1] / (len(chunk_sentences[0]) * len(chunk_sentences))
+                        else:
+                            loss = loss / len(chunk_trees)
+                        
+                        loss_value = float(loss.data.cpu().numpy())
+                        batch_loss_value += loss_value
+                        if loss_value > 0:
+                            loss.backward()
+                        del loss
+                        total_processed += len(chunk_trees)
+                        current_processed += len(chunk_trees)
+
+            except RuntimeError as e:
+                print(f"Error in batch starting at index {start_index}")
+                print(f"Batch size: {len(batch_sentences)}")
+                print(f"Sentence lengths: {[len(s) for s in batch_sentences]}")
+                raise e
+
             grad_norm = torch.nn.utils.clip_grad_norm_(clippable_parameters, grad_clip_threshold)
-
             trainer.step()
             
-
-  
             if current_processed >= check_every:
                 current_processed -= check_every
                 dev_efscore = check_dev()
@@ -611,6 +637,8 @@ def main():
     subparser.add_argument("--batch-size", type=int, default=250)
     subparser.add_argument("--subbatch-max-tokens", type=int, default=2000)
     subparser.add_argument("--eval-batch-size", type=int, default=100)
+    subparser.add_argument("--min-subbatch-size", type=int, default=4)
+    subparser.add_argument("--max-subbatch-size", type=int, default=32)
     subparser.add_argument("--epochs", type=int)
     subparser.add_argument("--checks-per-epoch", type=int, default=4)
     subparser.add_argument("--print-vocabs", action="store_true")

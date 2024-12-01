@@ -40,7 +40,7 @@
   "sentence_max_len": 300,
   "special_label_weight": 2.05,
   "silver_train_path": "swbd-data/training-data/swdata_train_sentences_with_spkr_parse.txt",
-  "silver_weight": 4,
+  "silver_weight": 0,
   "step_decay": true,
   "step_decay_factor": 0.5,
   "step_decay_patience": 5,

@@ -293,7 +293,7 @@ class MultiHeadAttention(nn.Module):
         q_padded = q_s.new_zeros((n_head, mb_size, len_padded, d_k))
         k_padded = k_s.new_zeros((n_head, mb_size, len_padded, d_k))
         v_padded = v_s.new_zeros((n_head, mb_size, len_padded, d_v))
-        invalid_mask = q_s.new_ones((mb_size, len_padded), dtype=torch.uint8)
+        invalid_mask = q_s.new_ones((mb_size, len_padded), dtype=torch.bool)
 
         for i, (start, end) in enumerate(zip(batch_idxs.boundaries_np[:-1], batch_idxs.boundaries_np[1:])):
             q_padded[:,i,:end-start,:] = q_s[:,start:end,:]
@@ -347,6 +347,7 @@ class MultiHeadAttention(nn.Module):
             q_padded, k_padded, v_padded,
             attn_mask=attn_mask,
             )
+        output_mask = output_mask.bool() if output_mask.dtype == torch.uint8 else output_mask
         outputs = outputs_padded[output_mask]
         outputs = self.combine_v(outputs)
 
@@ -1212,3 +1213,9 @@ class NKChartParser(nn.Module):
 
         tree = make_tree()[0]
         return tree, score
+
+def ensure_bool_mask(mask):
+    """Convert uint8 masks to boolean masks."""
+    if mask.dtype == torch.uint8:
+        return mask.bool()
+    return mask
