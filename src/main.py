@@ -5,6 +5,7 @@ import time
 import sys
 import torch
 import torch.optim.lr_scheduler
+import time
 
 import numpy as np
 import random
@@ -138,6 +139,7 @@ def run_train(args, hparams):
     print("Hyperparameters:")
     hparams.print()
 
+    # Load training data
     print("Loading gold training trees from {}...".format(args.gold_train_path)) 
     print("Loading silver training trees from {}...".format(args.silver_train_path))
     if hparams.predict_tags and args.train_path.endswith('10way.clean'):
@@ -146,6 +148,14 @@ def run_train(args, hparams):
               "recommend enabling predict_tags in this configuration.")
     gold_train_treebank = trees.load_trees(args.gold_train_path)
     silver_train_treebank = trees.load_trees(args.silver_train_path)
+    
+    # Load development data
+    print("Loading development trees from {}...".format(args.dev_path))
+    dev_treebank = trees.load_trees(args.dev_path)
+    print(f"Number of dev examples: {len(dev_treebank)}")
+    
+    if hparams.max_len_dev > 0:
+        dev_treebank = [tree for tree in dev_treebank if len(list(tree.leaves())) <= hparams.max_len_dev]
     
     if args.silver_weight == 0:
         # Use only gold data
@@ -164,20 +174,30 @@ def run_train(args, hparams):
         if int(silver_batch_size*(len(gold_train_treebank)/new_batch_size))+1 < len(silver_train_treebank):
             silver_train_treebank = silver_train_treebank[:int(silver_batch_size*(len(gold_train_treebank)/new_batch_size))+1]
 
-    print("Loaded {:,} gold training examples.".format(len(gold_train_treebank)))
-    print("Loaded {:,} silver training examples.".format(len(silver_train_treebank)))
+    print("=== Training Data Statistics ===")
+    print(f"Number of gold training examples: {len(gold_train_treebank)}")
+    print(f"Batch size: {new_batch_size}")
+    print(f"Silver weight: {args.silver_weight}")
+    print("===============================")
 
-    print("Loading development trees from {}...".format(args.dev_path))
-    dev_treebank = trees.load_trees(args.dev_path)
-    if hparams.max_len_dev > 0:
-        dev_treebank = [tree for tree in dev_treebank if len(list(tree.leaves())) <= hparams.max_len_dev]
-    print("Loaded {:,} development examples.".format(len(dev_treebank)))
+    # Add validation for batch size
+    if new_batch_size <= 0:
+        print("ERROR: Invalid batch size calculated!")
+        print(f"args.batch_size: {args.batch_size}")
+        print(f"args.silver_weight: {args.silver_weight}")
+        raise ValueError(f"Calculated batch size ({new_batch_size}) must be positive!")
 
     print("Processing gold trees for training...")
     gold_train_parse = [tree.convert() for tree in gold_train_treebank]
 
     print("Processing silver trees for training...")
     silver_train_parse = [tree.convert() for tree in silver_train_treebank]
+
+    # Now we can check batch size against processed data
+    if new_batch_size > len(gold_train_parse):
+        print("WARNING: Batch size is larger than dataset!")
+        print(f"Reducing batch size from {new_batch_size} to {len(gold_train_parse)}")
+        new_batch_size = len(gold_train_parse)
 
     train_parse = gold_train_parse + silver_train_parse
 
@@ -252,24 +272,47 @@ def run_train(args, hparams):
 
     print("Initializing model...")
 
-    args.train_load_path = None
-    if args.train_load_path is not None:
+    if hasattr(args, 'train_load_path') and args.train_load_path is not None:
         print(f"Loading parameters from {args.train_load_path}")
         info = torch_load(args.train_load_path)
-        parser = parse_nk.NKChartParser.from_spec(info['spec'], info['state_dict'])
+        if 'mobilebert' in hparams.bert_model.lower():
+            parser = parse_nk.MobileBERTChartParser.from_spec(info['spec'], info['state_dict'])
+        else:
+            parser = parse_nk.NKChartParser.from_spec(info['spec'], info['state_dict'])
     else:
-        parser = parse_nk.NKChartParser(
-            tag_vocab,
-            word_vocab,
-            label_vocab,
-            char_vocab,
-            hparams,
-        )
+        if 'mobilebert' in hparams.bert_model.lower():
+            parser = parse_nk.MobileBERTChartParser(
+                tag_vocab,
+                word_vocab,
+                label_vocab,
+                char_vocab,
+                hparams,
+            )
+        else:
+            parser = parse_nk.NKChartParser(
+                tag_vocab,
+                word_vocab,
+                label_vocab,
+                char_vocab,
+                hparams,
+            )
+
+    # Print model size information after parser is created
+    print("\nModel size statistics:")
+    total_params = sum(p.numel() for p in parser.parameters())
+    trainable_params = sum(p.numel() for p in parser.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Print size of each major component
+    for name, module in parser.named_children():
+        params = sum(p.numel() for p in module.parameters())
+        print(f"{name}: {params:,} parameters")
 
     print("Initializing optimizer...")
     trainable_parameters = [param for param in parser.parameters() if param.requires_grad]
     trainer = torch.optim.Adam(trainable_parameters, lr=1., betas=(0.9, 0.98), eps=1e-9)
-    if args.train_load_path is not None:
+    if hasattr(args, 'train_load_path') and args.train_load_path is not None:
         trainer.load_state_dict(info['trainer'])
 
     def set_lr(new_lr):
@@ -292,13 +335,15 @@ def run_train(args, hparams):
 
     print("Training...")
     total_processed = 0
-    current_processed = 0
+    dev_elapsed_time = 0  # Track total time spent in evaluation
+    start_time = time.time()
     check_every = len(gold_train_parse) / args.checks_per_epoch
     best_dev_fscore = -np.inf
     best_dev_model_path = None
     best_dev_processed = 0
     best_dev_efscore = None
     dev_efscore = None
+    start_epoch = 0
 
     start_time = time.time()
 
@@ -307,36 +352,60 @@ def run_train(args, hparams):
         nonlocal best_dev_model_path
         nonlocal best_dev_processed
         nonlocal best_dev_efscore 
+        nonlocal dev_elapsed_time  # Make sure we can modify the outer variable
 
+        print("\nEvaluating on development set...")
         dev_start_time = time.time()
 
         dev_predicted = []
+        # Create progress bar for dev set evaluation
+        dev_pbar = tqdm(
+            total=len(dev_treebank),
+            desc="Dev evaluation",
+            bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} '
+                      '[{elapsed}<{remaining}, {rate_fmt}]',
+            ncols=100
+        )
+
         for dev_start_index in range(0, len(dev_treebank), args.eval_batch_size):
             subbatch_trees = dev_treebank[dev_start_index:dev_start_index+args.eval_batch_size]
             subbatch_sentences = [[(leaf.tag, leaf.word) for leaf in tree.leaves()] for tree in subbatch_trees]
+            
+            # Update progress bar description with current batch
+            dev_pbar.set_description(f"Dev evaluation (processing {dev_start_index+1}-{min(dev_start_index+args.eval_batch_size, len(dev_treebank))} of {len(dev_treebank)})")
+            
             predicted, _ = parser.parse_batch(subbatch_sentences)
             del _
             dev_predicted.extend([p.convert() for p in predicted])
+            
+            # Update progress
+            dev_pbar.update(len(subbatch_trees))
+
+        dev_pbar.close()
 
         dev_fscore = evaluate.evalb(args.evalb_dir, dev_treebank, dev_predicted)        
         dev_efscore = evaluate_EDITED.Evaluate(dev_treebank, dev_predicted)
 
-        # Log metrics with proper error handling
+        # Get current learning rate
+        current_lr = trainer.param_groups[0]['lr']
+
         metrics = {
-            # Parsing metrics (from evalb)
+            # Development metrics
             "dev/parsing/fscore": float(dev_fscore.fscore),
             "dev/parsing/recall": float(dev_fscore.recall),
             "dev/parsing/precision": float(dev_fscore.precision),
-            
-            # EDITED metrics (assuming it returns a single score)
             "dev/edited/score": float(dev_efscore.efscore),
-            
-            # Time metrics
+            "dev/best_score_so_far": max(best_dev_fscore, dev_efscore.efscore),
             "dev/elapsed_time": time.time() - dev_start_time,
-            "total_processed": total_processed
+            
+            # Training state metrics
+            "train/learning_rate": current_lr,
+            "train/total_processed": total_processed,
+            # Only count training time, not eval time
+            "train/examples_per_second": total_processed / (time.time() - start_time - dev_elapsed_time)
         }
 
-        # Add debug print to verify values
+        # Debug print
         print("Logging metrics:", metrics, flush=True)
         
         wandb.log(metrics)
@@ -369,11 +438,10 @@ def run_train(args, hparams):
             torch.save({
                    'spec': parser.spec,
                    'state_dict': parser.state_dict(),
-                   'trainer' : trainer.state_dict(),
-                      }, best_dev_model_path + ".pt") 
+                   'hparams': hparams.to_dict(),
+            }, best_dev_model_path + ".pt") 
 
         return dev_efscore
-            
     def check_hurdle(epoch, hurdle):
         if best_dev_fscore < hurdle:
             message = ("FAILURE: Epoch {} hurdle failed, stopping now!\n"
@@ -383,45 +451,34 @@ def run_train(args, hparams):
                 print(message, file=open(args.results_path, 'w'), flush=True)
             sys.exit(message)
 
-    for epoch in itertools.count(start=1):
-        if args.epochs is not None and epoch > args.epochs:
-            break
-
-        np.random.shuffle(gold_train_parse)
-        np.random.shuffle(silver_train_parse)
-        epoch_start_time = time.time()
-        silver_start_index = 0
-        
-        # Calculate total batches and samples
-        total_samples = len(gold_train_parse)
-        total_batches = (total_samples + new_batch_size - 1) // new_batch_size  # Ceiling division
-        
-        # Create tqdm progress bar with more detailed metrics
-        pbar = tqdm(range(0, len(gold_train_parse), new_batch_size), 
-                   total=total_batches,
-                   desc=f"Epoch {epoch}/{args.epochs if args.epochs else '∞'}",
-                   unit='batch',
-                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}, loss={postfix[0]:.4f}, avg_loss={postfix[1]:.4f}]',
-                   postfix=[0.0, 0.0])  # [current_loss, avg_loss]
-        
+    for epoch in range(start_epoch, args.epochs + 1):
+        print(f"\nStarting Epoch {epoch}")
+        current_processed = 0
         epoch_loss = 0.0
-        epoch_batches = 0
-
-        for start_index in pbar:
+        epoch_start_time = time.time()
+        
+        train_batches = [(start, start + new_batch_size) 
+                        for start in range(0, len(gold_train_parse), new_batch_size)]
+        print(f"Number of batches: {len(train_batches)}")
+        
+        # Initialize progress bar with more detailed format
+        pbar = tqdm(
+            total=len(train_batches),
+            desc=f"Epoch {epoch}/{args.epochs}",
+            bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+            ncols=100
+        )
+        
+        for batch_num, (start, end) in enumerate(train_batches):
+            batch_trees = gold_train_parse[start:end]
+            
+            # Update description instead of printing
+            pbar.set_description(f"Epoch {epoch}/{args.epochs} (batch {batch_num + 1}/{len(train_batches)}, {len(batch_trees)} examples)")
+            
             trainer.zero_grad()
             schedule_lr(total_processed // new_batch_size)
 
             batch_loss_value = 0.0
-            gold_batch_trees = gold_train_parse[start_index:start_index + new_batch_size]
-            
-            # Only add silver trees if silver_weight > 0
-            if args.silver_weight > 0:
-                silver_batch_trees = silver_train_parse[silver_start_index*silver_batch_size:(silver_start_index*silver_batch_size) + silver_batch_size]
-                batch_trees = gold_batch_trees + silver_batch_trees
-            else:
-                batch_trees = gold_batch_trees
-
-            # Sort batch by length before creating sentences
             batch_trees.sort(key=lambda tree: len(list(tree.leaves())), reverse=True)
             batch_sentences = [[(leaf.tag, leaf.word) for leaf in tree.leaves()] for tree in batch_trees]
 
@@ -446,10 +503,6 @@ def run_train(args, hparams):
                         chunk_sentences = list(group_sentences[i:i + chunk_size])
                         chunk_trees = group_trees[i:i + chunk_size]
                         
-                        #print(f"Debug - Processing length {group_key} chunk:")
-                        #print(f"- Chunk size: {len(chunk_sentences)}")
-                        #print(f"- Sentence length: {len(chunk_sentences[0])}")
-                        
                         _, loss = parser.parse_batch(chunk_sentences, chunk_trees)
                         
                         if hparams.predict_tags:
@@ -462,11 +515,13 @@ def run_train(args, hparams):
                         if loss_value > 0:
                             loss.backward()
                         del loss
+
+                        # Increment total_processed only once per example
                         total_processed += len(chunk_trees)
                         current_processed += len(chunk_trees)
 
             except RuntimeError as e:
-                print(f"Error in batch starting at index {start_index}")
+                print(f"Error in batch starting at index {start}")
                 print(f"Batch size: {len(batch_sentences)}")
                 print(f"Sentence lengths: {[len(s) for s in batch_sentences]}")
                 raise e
@@ -474,37 +529,33 @@ def run_train(args, hparams):
             grad_norm = torch.nn.utils.clip_grad_norm_(clippable_parameters, grad_clip_threshold)
             trainer.step()
             
-            # Update progress bar metrics
+            # Add batch loss to epoch loss
             epoch_loss += batch_loss_value
-            epoch_batches += 1
-            avg_loss = epoch_loss / epoch_batches
-            pbar.postfix[0] = batch_loss_value  # Current loss
-            pbar.postfix[1] = avg_loss  # Average loss
-            pbar.refresh()
-
-            # Log training metrics for each batch
-            wandb.log({
-                "train/batch_loss": batch_loss_value,
-                "train/avg_loss": avg_loss,
-                "train/learning_rate": trainer.param_groups[0]['lr'],
-                "train/grad_norm": grad_norm,
-                "train/epoch": epoch,
-                "train/global_step": total_processed // new_batch_size,
-                "train/processed_examples": total_processed,
-                "train/batch": epoch_batches,
-                "train/samples_processed": start_index + len(gold_batch_trees)
-            })
-
+            
+            # Update progress bar with loss information
+            pbar.set_postfix({
+                'loss': f'{batch_loss_value:.4f}',
+                'avg_loss': f'{epoch_loss/(batch_num + 1):.4f}'
+            }, refresh=True)
+            pbar.update(1)
+        
+        pbar.close()
+        
+        # Calculate average epoch loss
+        avg_epoch_loss = epoch_loss / len(train_batches)
+        
         # Log epoch-level metrics
         wandb.log({
             "train/epoch": epoch,
-            "train/final_epoch_loss": epoch_loss / max(1, epoch_batches),
+            "train/final_epoch_loss": avg_epoch_loss,
             "train/epoch_time": time.time() - epoch_start_time,
-            "train/total_batches": epoch_batches
+            "train/num_batches": len(train_batches)
         })
 
-        # Add evaluation at the end of each epoch
+        # Track evaluation time
+        dev_start = time.time()
         dev_efscore = check_dev()
+        dev_elapsed_time += time.time() - dev_start
         
         assert dev_efscore, "dev_efscore is zero/empty. Check evaluation logic."
         print ("epoch {:,} " "total-processed {} " "current-processed {}" .format(epoch, total_processed, current_processed))
