@@ -27,16 +27,34 @@ def tree_tb(tree):
 class Evaluate:
     """Evaluation for the self-attentive parser.
     """
-    def __init__(self, gold_trees, predicted_trees, elabels=('EDITED',), dlabels=('EDITED','PRN','UH')):
+    def __init__(self, gold_trees, predicted_trees, 
+                 elabels=('EDITED',), 
+                 dlabels=('EDITED','PRN','UH'),
+                 evaluate_reparandum=True,
+                 evaluate_interregnum=True):
         self.dlabels = dlabels
         self.elabels = elabels
+        self.evaluate_reparandum = evaluate_reparandum
+        self.evaluate_interregnum = evaluate_interregnum
+        
         assert len(gold_trees) == len(predicted_trees)
         e = evalparse.EvalParse(evaluate_word_coverage=True)
+        
         for g, p in zip(gold_trees, predicted_trees):
             e.update1(tree_tb(g), tree_tb(p))
+            
         self.evalparse = e
         self.fscore = e.fscore()
-        self.efscore = e.fscore(labels=elabels)
+        
+        # Compute separate scores based on what we're evaluating
+        if self.evaluate_reparandum:
+            self.reparandum_score = e.fscore(labels=('EDITED',))
+        if self.evaluate_interregnum:
+            self.interregnum_score = e.fscore(labels=('UH', 'PRN'))
+            
+        # Compute combined score if both are being evaluated
+        if self.evaluate_reparandum and self.evaluate_interregnum:
+            self.combined_score = (self.reparandum_score + self.interregnum_score) / 2
 
     def __str__(self):
         return '; '.join((self.evalparse.summary(), 

@@ -6,6 +6,7 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.init as init
+import torch.nn.functional as F  
 
 use_cuda = torch.cuda.is_available()
 if use_cuda:
@@ -1267,6 +1268,14 @@ class MobileBERTChartParser(NKChartParser):
             else:
                 self.project_bert = nn.Linear(d_bert_annotations, self.d_content, bias=False)
         
+        # Add interregnum classifier if enabled
+        if hparams.use_interregnum_markers:
+            self.f_interregnum = nn.Linear(self.d_model, 2)  # Binary classification
+            if use_cuda:
+                self.f_interregnum = self.f_interregnum.cuda()
+            self.interregnum_weight = hparams.interregnum_weight
+            self.reparandum_weight = hparams.reparandum_weight
+        
         # Restore original hparams
         self.spec['hparams'] = hparams.to_dict()
         
@@ -1274,7 +1283,7 @@ class MobileBERTChartParser(NKChartParser):
         if use_cuda:
             self.cuda()
 
-    def parse_batch(self, sentences, golds=None, return_label_scores_charts=False):
+    def parse_batch(self, sentences, golds=None, return_label_scores_charts=False, return_separate_losses=False, compute_reparandum=True, compute_interregnum=False):
         is_train = golds is not None
         self.train(is_train)
         torch.set_grad_enabled(is_train)
@@ -1457,23 +1466,13 @@ class MobileBERTChartParser(NKChartParser):
             )
             features = outputs.last_hidden_state  # Get the last hidden state
 
-            if self.encoder is not None:
-                features_packed = features.masked_select(all_word_end_mask.bool().unsqueeze(-1)).reshape(-1, features.shape[-1])
-                extra_content_annotations = self.project_bert(features_packed)
-            else:
-                fencepost_annotations_start = features.masked_select(all_word_start_mask.bool().unsqueeze(-1)).reshape(-1, features.shape[-1])
-                fencepost_annotations_end = features.masked_select(all_word_end_mask.bool().unsqueeze(-1)).reshape(-1, features.shape[-1])
-                
-                if self.f_tag is not None:
-                    tag_annotations = fencepost_annotations_end
+        # Initialize tag_annotations
+        tag_annotations = None
 
         if self.encoder is not None:
             annotations, _ = self.encoder(emb_idxs, batch_idxs, extra_content_annotations=extra_content_annotations)
 
             if self.partitioned:
-                # Rearrange the annotations to ensure that the transition to
-                # fenceposts captures an even split between position and content.
-                # TODO(nikita): try alternatives, such as omitting position entirely
                 annotations = torch.cat([
                     annotations[:, 0::2],
                     annotations[:, 1::2],
@@ -1496,16 +1495,18 @@ class MobileBERTChartParser(NKChartParser):
             if self.f_tag is not None:
                 tag_annotations = fencepost_annotations_end
 
-        if self.f_tag is not None:
+        # Define fencepost boundaries
+        # Note that the subtraction creates fenceposts at sentence boundaries, 
+        # which are not used by our parser. Hence subtract 1 when creating fp_endpoints
+        fp_startpoints = batch_idxs.boundaries_np[:-1]
+        fp_endpoints = batch_idxs.boundaries_np[1:] - 1
+
+        # Compute tag loss if we have tag annotations
+        tag_loss = None
+        if self.f_tag is not None and tag_annotations is not None:
             tag_logits = self.f_tag(tag_annotations)
             if is_train:
                 tag_loss = self.tag_loss_scale * nn.functional.cross_entropy(tag_logits, gold_tag_idxs, reduction='sum')
-
-        # Note that the subtraction above creates fenceposts at sentence
-        # boundaries, which are not used by our parser. Hence subtract 1
-        # when creating fp_endpoints
-        fp_startpoints = batch_idxs.boundaries_np[:-1]
-        fp_endpoints = batch_idxs.boundaries_np[1:] - 1
 
         # Just return the charts, for ensembling
         if return_label_scores_charts:
@@ -1528,19 +1529,17 @@ class MobileBERTChartParser(NKChartParser):
                 sentence = sentences[i]
                 if self.f_tag is not None:
                     sentence = list(zip(per_sentence_tags[i], [x[1] for x in sentence]))
-                tree, score = self.parse_from_annotations(fencepost_annotations_start[start:end,:], fencepost_annotations_end[start:end,:], sentence, golds[i])
+                tree, score = self.parse_from_annotations(
+                    fencepost_annotations_start[start:end,:],
+                    fencepost_annotations_end[start:end,:],
+                    sentence,
+                    golds[i]
+                )
                 trees.append(tree)
                 scores.append(score)
             return trees, scores
 
-        # During training time, the forward pass needs to be computed for every
-        # cell of the chart, but the backward pass only needs to be computed for
-        # cells in either the predicted or the gold parse tree. It's slightly
-        # faster to duplicate the forward pass for a subset of the chart than it
-        # is to perform a backward pass that doesn't take advantage of sparsity.
-        # Since this code is not undergoing algorithmic changes, it makes sense
-        # to include the optimization even though it may only be a 10% speedup.
-        # Note that no dropout occurs in the label portion of the network
+        # During training time
         pis = []
         pjs = []
         plabels = []
@@ -1549,35 +1548,112 @@ class MobileBERTChartParser(NKChartParser):
         gis = []
         gjs = []
         glabels = []
-        with torch.no_grad():
-            for i, (start, end) in enumerate(zip(fp_startpoints, fp_endpoints)):
-                p_i, p_j, p_label, p_augment, g_i, g_j, g_label = self.parse_from_annotations(fencepost_annotations_start[start:end,:], fencepost_annotations_end[start:end,:], sentences[i], golds[i])
-                paugment_total += p_augment
-                num_p += p_i.shape[0]
-                pis.append(p_i + start)
-                pjs.append(p_j + start)
-                gis.append(g_i + start)
-                gjs.append(g_j + start)
-                plabels.append(p_label)
-                glabels.append(g_label)
 
-        cells_i = from_numpy(np.concatenate(pis + gis))
-        cells_j = from_numpy(np.concatenate(pjs + gjs))
-        cells_label = from_numpy(np.concatenate(plabels + glabels))
+        # Collect spans for reparandum if enabled
+        if compute_reparandum:
+            with torch.no_grad():
+                for i, (start, end) in enumerate(zip(fp_startpoints, fp_endpoints)):
+                    # Get spans for reparandum (EDITED nodes)
+                    result = self.parse_from_annotations(
+                        fencepost_annotations_start[start:end,:],
+                        fencepost_annotations_end[start:end,:],
+                        sentences[i],
+                        golds[i]
+                    )
+                    
+                    # Handle both training and evaluation returns
+                    if len(result) == 7:  # Training mode
+                        p_i, p_j, p_label, p_augment, g_i, g_j, g_label = result
+                        paugment_total += p_augment
+                        num_p += p_i.shape[0]
+                        pis.append(p_i + start)
+                        pjs.append(p_j + start)
+                        gis.append(g_i + start)
+                        gjs.append(g_j + start)
+                        plabels.append(p_label)
+                        glabels.append(g_label)
+                    else:  # Evaluation mode
+                        tree, score = result
+                        # Handle evaluation case if needed
+                        pass
 
-        cells_label_scores = self.f_label(fencepost_annotations_end[cells_j] - fencepost_annotations_start[cells_i])
-        cells_label_scores = torch.cat([
-                    cells_label_scores.new_zeros((cells_label_scores.size(0), 1)),
-                    cells_label_scores
-                    ], 1)
-        cells_scores = torch.gather(cells_label_scores, 1, cells_label[:, None])
-        loss = cells_scores[:num_p].sum() - cells_scores[num_p:].sum() + paugment_total
+        # Compute reparandum loss if enabled
+        if compute_reparandum:
+            cells_i = from_numpy(np.concatenate(pis + gis))
+            cells_j = from_numpy(np.concatenate(pjs + gjs))
+            cells_label = from_numpy(np.concatenate(plabels + glabels))
 
-        if self.f_tag is not None:
-            return None, (loss, tag_loss)
+            cells_label_scores = self.f_label(fencepost_annotations_end[cells_j] - fencepost_annotations_start[cells_i])
+            cells_label_scores = torch.cat([
+                cells_label_scores.new_zeros((cells_label_scores.size(0), 1)),
+                cells_label_scores
+            ], 1)
+            cells_scores = torch.gather(cells_label_scores, 1, cells_label[:, None])
+            reparandum_loss = cells_scores[:num_p].sum() - cells_scores[num_p:].sum() + paugment_total
         else:
-            return None, loss
-    
+            reparandum_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+
+        # Compute interregnum loss if enabled and we have tag annotations
+        if compute_interregnum and tag_annotations is not None:
+            interregnum_loss = self.compute_interregnum_loss(
+                tag_annotations, 
+                gold_tag_idxs if self.f_tag is not None else None,
+                sentences,
+                golds
+            )
+        else:
+            interregnum_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+
+        # Return losses based on mode
+        if return_separate_losses:
+            return (reparandum_loss, interregnum_loss), None
+        
+        # Combine losses using weights if specified
+        if hasattr(self, 'reparandum_weight') and hasattr(self, 'interregnum_weight'):
+            combined_loss = (
+                self.reparandum_weight * reparandum_loss + 
+                self.interregnum_weight * interregnum_loss
+            )
+        else:
+            combined_loss = reparandum_loss + interregnum_loss
+
+        if self.f_tag is not None and tag_loss is not None:
+            return combined_loss, tag_loss
+        else:
+            return combined_loss, None
+        
+    def compute_interregnum_loss(self, tag_annotations, gold_tag_idxs, sentences, golds):
+        """
+        Compute loss for interregnum detection.
+        """
+        if not hasattr(self, 'f_interregnum'):
+            # Create interregnum classifier if it doesn't exist
+            self.f_interregnum = nn.Linear(tag_annotations.shape[-1], 2)  # Binary classification
+            if use_cuda:
+                self.f_interregnum.cuda()
+        
+        # Create interregnum labels
+        interregnum_labels = []
+        for sentence, gold in zip(sentences, golds):
+            # Mark words as interregnum (1) if they have specific tags
+            labels = [1 if tag in self.hparams.interregnum_tags else 0 
+                    for tag, word in sentence]
+            interregnum_labels.extend(labels)
+        
+        interregnum_labels = torch.tensor(interregnum_labels, 
+                                        device=tag_annotations.device)
+        
+        # Compute interregnum logits and loss
+        interregnum_logits = self.f_interregnum(tag_annotations)
+        return F.cross_entropy(interregnum_logits, interregnum_labels, reduction='sum')
+
+
     def get_bert(self, bert_model, bert_do_lower_case):
         # This method is intentionally empty as we handle BERT initialization in __init__
         return self.bert_tokenizer, self.bert
+
+    def compute_interregnum_accuracy(self, predicted_labels, gold_labels):
+        """Compute accuracy for interregnum detection."""
+        correct = (predicted_labels == gold_labels).sum().item()
+        total = len(gold_labels)
+        return correct / total if total > 0 else 0.0

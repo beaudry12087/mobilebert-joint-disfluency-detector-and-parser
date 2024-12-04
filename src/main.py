@@ -90,10 +90,26 @@ def make_hparams():
         bert_transliterate="",
         min_subbatch_size=4,
         max_subbatch_size=32,
-        evalb_dir="EVALB"
+        evalb_dir="EVALB",
+
+        # Add more specific parameters for interregnum detection
+        interregnum_loss_scale=3.0,
+        use_interregnum_markers=True,
+        interregnum_tags=['UH', 'UM', 'UHH', 'ERR'],
+        reparandum_weight=0.6,
+        interregnum_weight=0.4,
         )
 
 def run_train(args, hparams):
+    # Add validation for interregnum-specific parameters
+    if hparams.use_interregnum_markers:
+        if not hasattr(hparams, 'interregnum_tags') or not hparams.interregnum_tags:
+            raise ValueError("interregnum_tags must be specified when use_interregnum_markers is True")
+        if not hasattr(hparams, 'interregnum_weight') or not hparams.interregnum_weight:
+            raise ValueError("interregnum_weight must be specified when use_interregnum_markers is True")
+        if not hasattr(hparams, 'reparandum_weight') or not hparams.reparandum_weight:
+            raise ValueError("reparandum_weight must be specified when use_interregnum_markers is True")
+
     # Initialize wandb with automatic config capture
     wandb_config = {
         # First, capture all hparams
@@ -148,6 +164,22 @@ def run_train(args, hparams):
               "recommend enabling predict_tags in this configuration.")
     gold_train_treebank = trees.load_trees(args.gold_train_path)
     silver_train_treebank = trees.load_trees(args.silver_train_path)
+    
+    # Add validation for interregnum labels
+    def validate_interregnum_labels(treebank, hparams):
+        interregnum_count = 0
+        for tree in treebank:
+            # Get all leaves from the tree
+            leaves = list(tree.leaves())
+            for leaf in leaves:
+                # Check if the leaf's tag is in our interregnum tags list
+                if leaf.tag in hparams.interregnum_tags:
+                    interregnum_count += 1
+        
+        print(f"Found {interregnum_count} interregnum markers in dataset")
+        return interregnum_count
+    
+    validate_interregnum_labels(gold_train_treebank, hparams)
     
     # Load development data
     print("Loading development trees from {}...".format(args.dev_path))
@@ -383,73 +415,153 @@ def run_train(args, hparams):
 
         dev_pbar.close()
 
-        dev_fscore = evaluate.evalb(args.evalb_dir, dev_treebank, dev_predicted)        
-        dev_efscore = evaluate_EDITED.Evaluate(dev_treebank, dev_predicted)
-
-        # Get current learning rate
-        current_lr = trainer.param_groups[0]['lr']
+        dev_fscore = evaluate.evalb(args.evalb_dir, dev_treebank, dev_predicted)
+        dev_efscore = evaluate_EDITED.Evaluate(
+            dev_treebank, 
+            dev_predicted,
+            evaluate_reparandum=True,
+            evaluate_interregnum=hparams.use_interregnum_markers
+        )
 
         metrics = {
-            # Development metrics
+            # Parsing metrics
             "dev/parsing/fscore": float(dev_fscore.fscore),
             "dev/parsing/recall": float(dev_fscore.recall),
             "dev/parsing/precision": float(dev_fscore.precision),
-            "dev/edited/score": float(dev_efscore.efscore),
-            "dev/best_score_so_far": max(best_dev_fscore, dev_efscore.efscore),
-            "dev/elapsed_time": time.time() - dev_start_time,
             
-            # Training state metrics
-            "train/learning_rate": current_lr,
-            "train/total_processed": total_processed,
-            # Only count training time, not eval time
-            "train/examples_per_second": total_processed / (time.time() - start_time - dev_elapsed_time)
+            # Always track reparandum score
+            "dev/reparandum/score": float(dev_efscore.reparandum_score),
         }
 
-        # Debug print
-        print("Logging metrics:", metrics, flush=True)
-        
+        if hparams.use_interregnum_markers:
+            # Add interregnum metrics when enabled
+            metrics.update({
+                "dev/interregnum/score": float(dev_efscore.interregnum_score),
+                "dev/combined/score": float(dev_efscore.combined_score)
+            })
+
         wandb.log(metrics)
 
-        print(
-            "dev-fscore {} "
-            "dev_efscore {}"
-            "dev-elapsed {} "
-            "total-elapsed {}".format(
-                dev_fscore,
-                dev_efscore,    
-                format_elapsed(dev_start_time),
-                format_elapsed(start_time)),   flush=True
-        )
-        # MJ - keep model with best efscore
-        if dev_efscore.efscore > best_dev_fscore:
+        if hparams.use_interregnum_markers:
+            print(
+                "dev-fscore {} "
+                "reparandum-score {:.4f} "
+                "interregnum-score {:.4f} "
+                "combined-score {:.4f} "
+                "dev-elapsed {} "
+                "total-elapsed {}".format(
+                    dev_fscore,
+                    dev_efscore.reparandum_score,
+                    dev_efscore.interregnum_score,
+                    dev_efscore.combined_score,
+                    format_elapsed(dev_start_time),
+                    format_elapsed(start_time)),
+                flush=True
+            )
+        else:
+            print(
+                "dev-fscore {} "
+                "reparandum-score {:.4f} "
+                "dev-elapsed {} "
+                "total-elapsed {}".format(
+                    dev_fscore,
+                    dev_efscore.reparandum_score,
+                    format_elapsed(dev_start_time),
+                    format_elapsed(start_time)),
+                flush=True
+            )
+
+        # Use combined_score for model selection since we're evaluating both tasks
+        if dev_efscore.combined_score > best_dev_fscore:
             if best_dev_model_path is not None:
                 extensions = [".pt"]
                 for ext in extensions:
                     path = best_dev_model_path + ext
                     if os.path.exists(path):
-                        print(" Removing previous model file {}...".format(path), flush=True)
+                        print(" Removing previous model file {}...".format(path))
                         os.remove(path)
-            best_dev_efscore = dev_efscore
-            best_dev_fscore = dev_efscore.efscore
-            best_dev_model_path = "{}_Edev={:.4}".format(
-                args.model_path_base, dev_efscore.efscore)
-            best_dev_processed = total_processed
-            print(" Saving new best model to {}...".format(best_dev_model_path), flush=True)
-            torch.save({
-                   'spec': parser.spec,
-                   'state_dict': parser.state_dict(),
-                   'hparams': hparams.to_dict(),
-            }, best_dev_model_path + ".pt") 
 
+            best_dev_efscore = dev_efscore
+            best_dev_fscore = dev_efscore.combined_score
+            
+            # Format model path based on enabled tasks
+            if hparams.use_interregnum_markers:
+                best_dev_model_path = "{}_dev={:.4f}_rep={:.4f}_int={:.4f}".format(
+                    args.model_path_base, 
+                    dev_efscore.combined_score,
+                    dev_efscore.reparandum_score,
+                    dev_efscore.interregnum_score
+                )
+            else:
+                best_dev_model_path = "{}_dev={:.4f}_rep={:.4f}".format(
+                    args.model_path_base, 
+                    dev_efscore.fscore,
+                    dev_efscore.reparandum_score
+                )
+            
+            best_dev_processed = total_processed
+
+            print(" Saving new best model to {}...".format(best_dev_model_path))
+            
+            # Prepare metrics based on enabled tasks
+            metrics = {
+                'fscore': dev_efscore.fscore,
+                'reparandum_score': dev_efscore.reparandum_score,
+            }
+            
+            if hparams.use_interregnum_markers:
+                metrics.update({
+                    'combined_score': dev_efscore.combined_score,
+                    'interregnum_score': dev_efscore.interregnum_score,
+                })
+            
+            # Prepare task config based on enabled tasks
+            task_config = {
+                'use_interregnum_markers': hparams.use_interregnum_markers,
+                'reparandum_weight': hparams.reparandum_weight,
+            }
+            
+            if hparams.use_interregnum_markers:
+                task_config.update({
+                    'interregnum_tags': hparams.interregnum_tags,
+                    'interregnum_weight': hparams.interregnum_weight
+                })
+
+            torch.save({
+                'spec': parser.spec,
+                'state_dict': parser.state_dict(),
+                'trainer': trainer.state_dict(),
+                'hparams': hparams.to_dict(),
+                'metrics': metrics,
+                'task_config': task_config
+            }, best_dev_model_path + ".pt")
         return dev_efscore
+
     def check_hurdle(epoch, hurdle):
-        if best_dev_fscore < hurdle:
-            message = ("FAILURE: Epoch {} hurdle failed, stopping now!\n"
-                       "best_dev_fscore = {} < epoch{}_hurdle = {}".format(epoch, best_dev_fscore, epoch, hurdle))
-            print(message, flush=True)
-            if args.results_path:
-                print(message, file=open(args.results_path, 'w'), flush=True)
-            sys.exit(message)
+        if hparams.use_interregnum_markers:
+            # Check both tasks when using interregnum detection
+            if (dev_efscore.reparandum_score < hurdle or 
+                dev_efscore.interregnum_score < hurdle):
+                message = (
+                    f"FAILURE: Epoch {epoch} hurdle failed, stopping now!\n"
+                    f"reparandum_score = {dev_efscore.reparandum_score} < hurdle = {hurdle}\n"
+                    f"interregnum_score = {dev_efscore.interregnum_score} < hurdle = {hurdle}"
+                )
+                print(message, flush=True)
+                if args.results_path:
+                    print(message, file=open(args.results_path, 'w'), flush=True)
+                sys.exit(message)
+        else:
+            # Only check reparandum score
+            if dev_efscore.reparandum_score < hurdle:
+                message = (
+                    f"FAILURE: Epoch {epoch} hurdle failed, stopping now!\n"
+                    f"reparandum_score = {dev_efscore.reparandum_score} < hurdle = {hurdle}"
+                )
+                print(message, flush=True)
+                if args.results_path:
+                    print(message, file=open(args.results_path, 'w'), flush=True)
+                sys.exit(message)
 
     for epoch in range(start_epoch, args.epochs + 1):
         print(f"\nStarting Epoch {epoch}")
@@ -503,18 +615,34 @@ def run_train(args, hparams):
                         chunk_sentences = list(group_sentences[i:i + chunk_size])
                         chunk_trees = group_trees[i:i + chunk_size]
                         
-                        _, loss = parser.parse_batch(chunk_sentences, chunk_trees)
-                        
-                        if hparams.predict_tags:
-                            loss = loss[0] / len(chunk_trees) + loss[1] / (len(chunk_sentences[0]) * len(chunk_sentences))
+                        # Get losses based on what we're training
+                        if hparams.use_interregnum_markers:
+                            # Get separate losses for both tasks
+                            loss, tag_loss = parser.parse_batch(
+                                chunk_sentences, 
+                                chunk_trees,
+                                compute_reparandum=True,
+                                compute_interregnum=True
+                            )
                         else:
-                            loss = loss / len(chunk_trees)
+                            # Only compute reparandum loss
+                            loss, tag_loss = parser.parse_batch(
+                                chunk_sentences, 
+                                chunk_trees,
+                                compute_reparandum=True,
+                                compute_interregnum=False
+                            )
                         
+                        if tag_loss is not None:
+                            loss = loss + tag_loss
+
                         loss_value = float(loss.data.cpu().numpy())
                         batch_loss_value += loss_value
                         if loss_value > 0:
                             loss.backward()
                         del loss
+                        if tag_loss is not None:
+                            del tag_loss
 
                         # Increment total_processed only once per example
                         total_processed += len(chunk_trees)
@@ -544,13 +672,21 @@ def run_train(args, hparams):
         # Calculate average epoch loss
         avg_epoch_loss = epoch_loss / len(train_batches)
         
-        # Log epoch-level metrics
-        wandb.log({
+        # Log epoch-level metrics with task-specific information
+        metrics = {
             "train/epoch": epoch,
             "train/final_epoch_loss": avg_epoch_loss,
             "train/epoch_time": time.time() - epoch_start_time,
             "train/num_batches": len(train_batches)
-        })
+        }
+        
+        if hparams.use_interregnum_markers:
+            metrics.update({
+                "train/reparandum_weight": hparams.reparandum_weight,
+                "train/interregnum_weight": hparams.interregnum_weight
+            })
+            
+        wandb.log(metrics)
 
         # Track evaluation time
         dev_start = time.time()
@@ -821,6 +957,8 @@ def main():
     subparser.add_argument("--results-path", default=None)
     subparser.add_argument("--silver-weight", default=4, type=int, help="Weights on using silver parse trees in each mini-batch") 
     subparser.add_argument("--train-load-path", required=True)
+    subparser.add_argument("--interregnum-weight", type=float, default=0.4, help="Weight for interregnum detection loss")
+    subparser.add_argument("--reparandum-weight", type=float, default=0.6, help="Weight for reparandum detection loss")
 
     subparser = subparsers.add_parser("test")
     subparser.set_defaults(callback=run_test)
