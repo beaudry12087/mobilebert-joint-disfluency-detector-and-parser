@@ -56,5 +56,11 @@
     "wandb_project": "mobile-disfluency-detection-training",
     "run_name": "mobilebert_experiment",
     "is_experimental": false,
-    "s3_bucket": "your-bucket-name" 
+    "s3_bucket": "your-bucket-name",
+    "quantization": {
+        "enable": true,
+        "output_path": "results/quantized_model.tflite",
+        "inference_type": "int8",
+        "optimization_default": true
+    }
   }

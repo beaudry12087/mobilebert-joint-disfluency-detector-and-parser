@@ -18,4 +18,8 @@ nltk
 typing
 wandb==0.18.2
 pytorch-pretrained-bert==0.6.2 
-tensorflow==2.12.0  # Add the correct version of TensorFlow here
+tensorflow==2.13.0  
+onnx==1.14.1
+onnx-tf==1.10.0
+tensorflow-probability==0.21.0
+tf-keras==2.13.0

@@ -18,6 +18,7 @@ import parse_nk
 tokens = parse_nk
 import evaluate_EDITED
 from tqdm import tqdm
+import tensorflow as tf
 import wandb
 
 def torch_load(load_path):
@@ -98,7 +99,119 @@ def make_hparams():
         interregnum_tags=['UH', 'UM', 'UHH', 'ERR'],
         reparandum_weight=0.6,
         interregnum_weight=0.4,
-        )
+
+        # Add quantization parameters
+        quantization=dict(
+            enable=False,  # Disabled by default
+            output_path="results/quantized_model.tflite",
+            inference_type="int8",
+            optimization_default=True
+        ),
+    )
+
+def quantize_and_save_model(parser, config):
+    """
+    Quantize and save model based on configuration parameters
+    """
+    if not config.get("quantization", {}).get("enable", False):
+        return
+    
+    try:
+        import tensorflow as tf
+        import numpy as np
+        from transformers import TFMobileBertModel
+        import signal
+        from contextlib import contextmanager
+        import time
+    except ImportError as e:
+        print(f"Error: Missing required package - {str(e)}")
+        return
+
+    @contextmanager
+    def timeout(seconds):
+        def signal_handler(signum, frame):
+            raise TimeoutError("Quantization timed out!")
+        
+        signal.signal(signal.SIGALRM, signal_handler)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+    
+    print("Converting and quantizing model...")
+    
+    class TFMobileBERTWrapper(tf.keras.Model):
+        def __init__(self, config):
+            super(TFMobileBERTWrapper, self).__init__()
+            self.bert = TFMobileBertModel.from_pretrained(
+                'google/mobilebert-uncased',
+                from_pt=True,  # Enable PyTorch weight loading
+                output_hidden_states=True
+            )
+            
+        def call(self, inputs, training=False):
+            return self.bert(inputs, training=training).last_hidden_state
+    
+    # Create model with simplified architecture
+    tf_model = TFMobileBERTWrapper({})
+    
+    # Create sample input and run model once to build
+    seq_length = 512
+    sample_input = tf.random.uniform((1, seq_length), minval=0, maxval=30522, dtype=tf.int32)
+    
+    print("Building model...")
+    _ = tf_model(sample_input)
+    print(f"Model parameters: {tf_model.count_params():,}")
+    
+    print("Saving TF model...")
+    tf.saved_model.save(tf_model, "temp_saved_model")
+    
+    print("Converting to TFLite (this might take a few minutes)...")
+    converter = tf.lite.TFLiteConverter.from_saved_model("temp_saved_model")
+    
+    # Use dynamic range quantization instead of full integer
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS,
+        tf.lite.OpsSet.SELECT_TF_OPS
+    ]
+    
+    try:
+        with timeout(300):  # 5 minute timeout
+            print("Starting quantization...")
+            start_time = time.time()
+            tflite_model = converter.convert()
+            conversion_time = time.time() - start_time
+            print(f"Quantization completed in {conversion_time:.1f} seconds")
+            
+            output_path = config.get("output_path", "quantized_model.tflite")
+            with open(output_path, 'wb') as f:
+                f.write(tflite_model)
+            
+            # Report sizes
+            import os
+            tflite_size = os.path.getsize(output_path) / (1024 * 1024)
+            pt_model_path = config.get("model_path", best_dev_model_path + ".pt")
+            original_size = os.path.getsize(pt_model_path) / (1024 * 1024)
+            
+            print(f"\nModel Size Comparison:")
+            print(f"Original PyTorch model: {original_size:.2f} MB")
+            print(f"Quantized TFLite model: {tflite_size:.2f} MB")
+            print(f"Compression ratio: {original_size/tflite_size:.2f}x")
+            
+    except TimeoutError:
+        print("Quantization timed out after 5 minutes!")
+        return
+    except Exception as e:
+        print(f"Error during quantization: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return
+    finally:
+        # Cleanup
+        import shutil
+        shutil.rmtree("temp_saved_model", ignore_errors=True)
 
 def run_train(args, hparams):
     # Add validation for interregnum-specific parameters
@@ -379,12 +492,12 @@ def run_train(args, hparams):
 
     start_time = time.time()
 
-    def check_dev():
+    def check_dev(train_parse):
         nonlocal best_dev_fscore
         nonlocal best_dev_model_path
         nonlocal best_dev_processed
-        nonlocal best_dev_efscore 
-        nonlocal dev_elapsed_time  # Make sure we can modify the outer variable
+        nonlocal best_dev_efscore
+        nonlocal dev_elapsed_time
 
         print("\nEvaluating on development set...")
         dev_start_time = time.time()
@@ -535,6 +648,31 @@ def run_train(args, hparams):
                 'metrics': metrics,
                 'task_config': task_config
             }, best_dev_model_path + ".pt")
+            
+            # Add quantization here
+            if hasattr(hparams, 'quantization') and isinstance(parser, parse_nk.MobileBERTChartParser):
+                print("Quantizing best model...")
+                # Create a representative dataset from train_parse
+                def get_input_from_parse(parse_tree):
+                    # Extract input features from parse tree
+                    # Adjust this based on your model's input requirements
+                    sentences = [(leaf.tag, leaf.word) for leaf in parse_tree.leaves()]
+                    return sentences
+
+                def representative_dataset_gen():
+                    for tree in train_parse[:100]:  # Use first 100 examples for calibration
+                        input_data = get_input_from_parse(tree)
+                        yield [input_data]
+
+                print("Quantizing best model...")
+                quantize_config = hparams.to_dict()
+                quantize_config['quantization'] = {
+                    'enable': True,
+                    'output_path': best_dev_model_path + ".tflite",
+                    'inference_type': 'int8',
+                    'optimization_default': True
+                }
+                quantize_and_save_model(parser, quantize_config)
         return dev_efscore
 
     def check_hurdle(epoch, hurdle):
@@ -690,7 +828,7 @@ def run_train(args, hparams):
 
         # Track evaluation time
         dev_start = time.time()
-        dev_efscore = check_dev()
+        dev_efscore = check_dev(train_parse)
         dev_elapsed_time += time.time() - dev_start
         
         assert dev_efscore, "dev_efscore is zero/empty. Check evaluation logic."
@@ -703,7 +841,7 @@ def run_train(args, hparams):
         
         # adjust learning rate at the end of an epoch
         if (total_processed // new_batch_size + 1) > hparams.learning_rate_warmup_steps:
-            scheduler.step(dev_efscore.efscore)
+            scheduler.step(dev_efscore.combined_score) 
             if (total_processed - best_dev_processed) > ((hparams.step_decay_patience + 1) * hparams.max_consecutive_decays * len(gold_train_parse)):
                 print("Terminating due to lack of improvement in dev fscore.")
                 break
