@@ -56,7 +56,7 @@
     "wandb_project": "mobile-disfluency-detection-training",
     "run_name": "mobilebert_experiment",
     "is_experimental": false,
-    "s3_bucket": "your-bucket-name",
+    "s3_bucket": "com.trebble.ml.training.data",
     "quantization": {
         "enable": true,
         "output_path": "results/quantized_model.tflite",

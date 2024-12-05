@@ -21,6 +21,9 @@ from tqdm import tqdm
 import tensorflow as tf
 import wandb
 import os
+import boto3
+from botocore.exceptions import NoCredentialsError
+import json
 
 def torch_load(load_path):
     if parse_nk.use_cuda:
@@ -108,7 +111,25 @@ def make_hparams():
             inference_type="int8",
             optimization_default=True
         ),
+        s3_bucket="armel", 
+        run_name="mobilebert_experiment"
     )
+
+def upload_to_s3(file_path, bucket_name, s3_file_name):
+    if not bucket_name:
+        print("No S3 bucket specified in config. Skipping S3 upload.")
+        return
+        
+    s3 = boto3.client('s3')
+    try:
+        s3.upload_file(file_path, bucket_name, s3_file_name)
+        print(f"Successfully uploaded {file_path} to s3://{bucket_name}/{s3_file_name}")
+    except FileNotFoundError:
+        print(f"The file {file_path} was not found.")
+    except NoCredentialsError:
+        print("Credentials not available for AWS S3.")
+    except Exception as e:
+        print(f"Error uploading to S3: {str(e)}")
 
 def quantize_and_save_model(parser, config, model_path=None):
     """
@@ -227,6 +248,19 @@ def quantize_and_save_model(parser, config, model_path=None):
             
             # Log the artifact
             wandb.log_artifact(artifact)
+            
+            # Use the s3_bucket from config
+            s3_bucket = config.get('s3_bucket', '')
+            if s3_bucket:
+                print(f"\nUploading models to S3 bucket: {s3_bucket}")
+                run_name = config.get('run_name', 'default_run')
+                s3_pt_path = f"{run_name}/pytorch_model.pt"
+                s3_tflite_path = f"{run_name}/quantized_model.tflite"
+                
+                upload_to_s3(pt_model_path, s3_bucket, s3_pt_path)
+                upload_to_s3(output_path, s3_bucket, s3_tflite_path)
+            else:
+                print("\nNo S3 bucket specified in config. Skipping S3 upload.")
             
     except TimeoutError:
         print("Quantization timed out after 5 minutes!")
@@ -680,7 +714,9 @@ def run_train(args, hparams):
             artifact = wandb.Artifact('model', type='model')
             artifact.add_file(best_dev_model_path + ".pt")
             wandb.log_artifact(artifact)
-            
+
+        upload_to_s3(  best_dev_model_path + ".pt", hparams.s3_bucket, f"{hparams.run_name}/best_pytorch_model/{best_dev_model_path}.pt")
+
         return dev_efscore
 
     def check_hurdle(epoch, hurdle):
@@ -1106,6 +1142,10 @@ def run_viz(args):
                 attns = attns_padded[snum::len(subbatch_sentences), :len(sentence_words), :len(sentence_words)]
                 viz_attention(sentence_words, attns)
 
+def load_config(config_path):
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1136,6 +1176,8 @@ def main():
     subparser.add_argument("--train-load-path", required=True)
     #subparser.add_argument("--interregnum-weight", type=float, default=0.4, help="Weight for interregnum detection loss")
     #subparser.add_argument("--reparandum-weight", type=float, default=0.6, help="Weight for reparandum detection loss")
+    subparser.add_argument("--s3-bucket", type=str, help="S3 bucket name for storing models")
+    subparser.add_argument("--config-path", type=str, help="Path to JSON config file")
 
     subparser = subparsers.add_parser("test")
     subparser.set_defaults(callback=run_test)
@@ -1167,7 +1209,11 @@ def main():
     subparser.add_argument("--eval-batch-size", type=int, default=100)    
 
     args = parser.parse_args()
-    args.callback(args)
+    if hasattr(args, 'config_path') and args.config_path:
+        config = load_config(args.config_path)
+        args.callback(args, config)
+    else:
+        args.callback(args)
 
 # %%
 if __name__ == "__main__":
