@@ -109,7 +109,7 @@ def make_hparams():
         ),
     )
 
-def quantize_and_save_model(parser, config):
+def quantize_and_save_model(parser, config, model_path=None):
     """
     Quantize and save model based on configuration parameters
     """
@@ -192,7 +192,11 @@ def quantize_and_save_model(parser, config):
             # Report sizes
             import os
             tflite_size = os.path.getsize(output_path) / (1024 * 1024)
-            pt_model_path = config.get("model_path", best_dev_model_path + ".pt")
+            # Use the provided model_path instead of best_dev_model_path
+            pt_model_path = config.get("model_path", model_path)
+            if pt_model_path is None:
+                raise ValueError("No model path provided for size comparison")
+                
             original_size = os.path.getsize(pt_model_path) / (1024 * 1024)
             
             print(f"\nModel Size Comparison:")
@@ -672,7 +676,7 @@ def run_train(args, hparams):
                     'inference_type': 'int8',
                     'optimization_default': True
                 }
-                quantize_and_save_model(parser, quantize_config)
+                quantize_and_save_model(parser, quantize_config, best_dev_model_path + ".pt")
         return dev_efscore
 
     def check_hurdle(epoch, hurdle):
@@ -981,12 +985,21 @@ def run_parse(args):
 
     info = torch_load(args.model_path_base)
     assert 'hparams' in info['spec'], "Older savefiles not supported"
-    parser = parse_nk.NKChartParser.from_spec(info['spec'], info['state_dict'])
+    
+    # Check if the model is MobileBERT based on the spec
+    is_mobilebert = 'mobilebert' in info['spec']['hparams'].get('bert_model', '').lower()
+    
+    if is_mobilebert:
+        print("Loading MobileBERT model...")
+        parser = parse_nk.MobileBERTChartParser.from_spec(info['spec'], info['state_dict'])
+    else:
+        print("Loading BERT model...")
+        parser = parse_nk.NKChartParser.from_spec(info['spec'], info['state_dict'])
 
     print("Parsing sentences...")
     with open(args.input_path) as input_file:
         sentences = input_file.readlines()
-    sentences = [sentence.split() for sentence in sentences]
+    sentences = [sentence.strip().split() for sentence in sentences]  # Added strip() to handle newlines
 
     # Tags are not available when parsing from raw text, so use a dummy tag
     if 'UNK' in parser.tag_vocab.indices:
@@ -997,24 +1010,34 @@ def run_parse(args):
     start_time = time.time()
 
     all_predicted = []
-    for start_index in range(0, len(sentences), args.eval_batch_size):
-        subbatch_sentences = sentences[start_index:start_index+args.eval_batch_size]
-
-        subbatch_sentences = [[(dummy_tag, word) for word in sentence] for sentence in subbatch_sentences]
-        predicted, _ = parser.parse_batch(subbatch_sentences)
-        del _
-        if args.output_path == '-':
-            for p in predicted:
-                print(p.convert().linearize())
-        else:
-            all_predicted.extend([p.convert() for p in predicted])
+    # Add progress bar for parsing
+    total_batches = (len(sentences) + args.eval_batch_size - 1) // args.eval_batch_size
+    with tqdm(total=total_batches, desc="Parsing progress") as pbar:
+        for start_index in range(0, len(sentences), args.eval_batch_size):
+            subbatch_sentences = sentences[start_index:start_index+args.eval_batch_size]
+            
+            try:
+                subbatch_sentences = [[(dummy_tag, word) for word in sentence] for sentence in subbatch_sentences]
+                predicted, _ = parser.parse_batch(subbatch_sentences)
+                del _
+                if args.output_path == '-':
+                    for p in predicted:
+                        print(p.convert().linearize())
+                else:
+                    all_predicted.extend([p.convert() for p in predicted])
+            except Exception as e:
+                print(f"Error processing batch starting at index {start_index}: {str(e)}")
+                continue
+            
+            pbar.update(1)
 
     if args.output_path != '-':
         with open(args.output_path, 'w') as output_file:
             for tree in all_predicted:
                 output_file.write("{}\n".format(tree.linearize()))
         print("Output written to:", args.output_path)
-#%%
+        print(f"Total sentences processed: {len(all_predicted)}")
+        print(f"Total time elapsed: {format_elapsed(start_time)}")
 
 def run_viz(args):
     assert args.model_path_base.endswith(".pt"), "Only pytorch savefiles supported"
@@ -1085,8 +1108,8 @@ def main():
     subparser.add_argument("--batch-size", type=int, default=250)
     subparser.add_argument("--subbatch-max-tokens", type=int, default=2000)
     subparser.add_argument("--eval-batch-size", type=int, default=100)
-    subparser.add_argument("--min-subbatch-size", type=int, default=4)
-    subparser.add_argument("--max-subbatch-size", type=int, default=32)
+    #subparser.add_argument("--min-subbatch-size", type=int, default=4)
+    #subparser.add_argument("--max-subbatch-size", type=int, default=32)
     subparser.add_argument("--epochs", type=int)
     subparser.add_argument("--checks-per-epoch", type=int, default=4)
     subparser.add_argument("--print-vocabs", action="store_true")
@@ -1095,8 +1118,8 @@ def main():
     subparser.add_argument("--results-path", default=None)
     subparser.add_argument("--silver-weight", default=4, type=int, help="Weights on using silver parse trees in each mini-batch") 
     subparser.add_argument("--train-load-path", required=True)
-    subparser.add_argument("--interregnum-weight", type=float, default=0.4, help="Weight for interregnum detection loss")
-    subparser.add_argument("--reparandum-weight", type=float, default=0.6, help="Weight for reparandum detection loss")
+    #subparser.add_argument("--interregnum-weight", type=float, default=0.4, help="Weight for interregnum detection loss")
+    #subparser.add_argument("--reparandum-weight", type=float, default=0.6, help="Weight for reparandum detection loss")
 
     subparser = subparsers.add_parser("test")
     subparser.set_defaults(callback=run_test)
