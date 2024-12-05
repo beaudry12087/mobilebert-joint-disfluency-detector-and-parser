@@ -3,6 +3,7 @@ import argparse
 import numpy as np
 from main import run_train, make_hparams
 import os
+import requests
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 parser = argparse.ArgumentParser()
@@ -63,12 +64,30 @@ def run_self_attentive_parser(run_config_filename, model_path=None, eval_out_pat
     hparams.set_from_args(args)
     run_train(args, hparams)
 
+def shutdown_runpod():
+    """Shutdown RunPod instance using the RunPod API"""
+    pod_id = os.environ.get('RUNPOD_POD_ID')
+    api_key = os.environ.get('RUNPOD_API_KEY')
+    
+    if pod_id and api_key:
+        try:
+            headers = {'Authorization': api_key}
+            url = f'https://api.runpod.io/v2/pod/{pod_id}/stop'
+            requests.post(url, headers=headers)
+            print("RunPod shutdown initiated")
+        except Exception as e:
+            print(f"Failed to shutdown RunPod: {e}")
+
 if __name__ == '__main__':
-	run_self_attentive_parser(
-		args.config, 
-		args.model_path, 
-		args.eval_path, 
-		args.evalb_dir,
-		args.override
-	)
+    try:
+        run_self_attentive_parser(
+            args.config, 
+            args.model_path, 
+            args.eval_path, 
+            args.evalb_dir,
+            args.override
+        )
+    finally:
+        # This will run whether the training succeeds or fails
+        shutdown_runpod()
 
