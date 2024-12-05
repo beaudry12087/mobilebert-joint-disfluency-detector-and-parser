@@ -20,6 +20,7 @@ import evaluate_EDITED
 from tqdm import tqdm
 import tensorflow as tf
 import wandb
+import os
 
 def torch_load(load_path):
     if parse_nk.use_cuda:
@@ -113,9 +114,14 @@ def quantize_and_save_model(parser, config, model_path=None):
     """
     Quantize and save model based on configuration parameters
     """
+    # Early exit conditions
     if not config.get("quantization", {}).get("enable", False):
         return
-    
+        
+    if not isinstance(parser, parse_nk.MobileBERTChartParser):
+        print("Quantization is only supported for MobileBERT models. Skipping...")
+        return
+        
     try:
         import tensorflow as tf
         import numpy as np
@@ -123,6 +129,8 @@ def quantize_and_save_model(parser, config, model_path=None):
         import signal
         from contextlib import contextmanager
         import time
+        import os
+        import wandb  # Add wandb import
     except ImportError as e:
         print(f"Error: Missing required package - {str(e)}")
         return
@@ -190,9 +198,7 @@ def quantize_and_save_model(parser, config, model_path=None):
                 f.write(tflite_model)
             
             # Report sizes
-            import os
             tflite_size = os.path.getsize(output_path) / (1024 * 1024)
-            # Use the provided model_path instead of best_dev_model_path
             pt_model_path = config.get("model_path", model_path)
             if pt_model_path is None:
                 raise ValueError("No model path provided for size comparison")
@@ -203,6 +209,24 @@ def quantize_and_save_model(parser, config, model_path=None):
             print(f"Original PyTorch model: {original_size:.2f} MB")
             print(f"Quantized TFLite model: {tflite_size:.2f} MB")
             print(f"Compression ratio: {original_size/tflite_size:.2f}x")
+            
+            # Create a new artifact for the models
+            artifact = wandb.Artifact('model_files', type='model')
+            
+            # Add both PyTorch and TFLite models to the artifact
+            artifact.add_file(pt_model_path, name='pytorch_model.pt')
+            artifact.add_file(output_path, name='quantized_model.tflite')
+            
+            # Log metrics about model sizes
+            wandb.log({
+                "model/pytorch_size_mb": original_size,
+                "model/tflite_size_mb": tflite_size,
+                "model/compression_ratio": original_size/tflite_size,
+                "model/quantization_time": conversion_time
+            })
+            
+            # Log the artifact
+            wandb.log_artifact(artifact)
             
     except TimeoutError:
         print("Quantization timed out after 5 minutes!")
@@ -652,31 +676,11 @@ def run_train(args, hparams):
                 'metrics': metrics,
                 'task_config': task_config
             }, best_dev_model_path + ".pt")
+
+            artifact = wandb.Artifact('model', type='model')
+            artifact.add_file(best_dev_model_path + ".pt")
+            wandb.log_artifact(artifact)
             
-            # Add quantization here
-            if hasattr(hparams, 'quantization') and isinstance(parser, parse_nk.MobileBERTChartParser):
-                print("Quantizing best model...")
-                # Create a representative dataset from train_parse
-                def get_input_from_parse(parse_tree):
-                    # Extract input features from parse tree
-                    # Adjust this based on your model's input requirements
-                    sentences = [(leaf.tag, leaf.word) for leaf in parse_tree.leaves()]
-                    return sentences
-
-                def representative_dataset_gen():
-                    for tree in train_parse[:100]:  # Use first 100 examples for calibration
-                        input_data = get_input_from_parse(tree)
-                        yield [input_data]
-
-                print("Quantizing best model...")
-                quantize_config = hparams.to_dict()
-                quantize_config['quantization'] = {
-                    'enable': True,
-                    'output_path': best_dev_model_path + ".tflite",
-                    'inference_type': 'int8',
-                    'optimization_default': True
-                }
-                quantize_and_save_model(parser, quantize_config, best_dev_model_path + ".pt")
         return dev_efscore
 
     def check_hurdle(epoch, hurdle):
@@ -856,6 +860,18 @@ def run_train(args, hparams):
         print(best_dev_efscore.table(), file=outf, flush=True)
     else:
         print(best_dev_efscore.table(), flush=True)
+        
+    # After training loop ends
+    if best_dev_model_path and hasattr(hparams, 'quantization'):
+        print("\nTraining completed. Starting final model quantization...")
+        quantize_config = hparams.to_dict()
+        quantize_config['quantization'] = {
+            'enable': True,
+            'output_path': best_dev_model_path + ".tflite",
+            'inference_type': 'int8',
+            'optimization_default': True
+        }
+        quantize_and_save_model(parser, quantize_config, best_dev_model_path + ".pt")
         
     # Close wandb run when training completes
     wandb.finish()
