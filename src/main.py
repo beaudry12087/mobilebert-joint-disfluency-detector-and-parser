@@ -784,6 +784,12 @@ def run_train(args, hparams):
                     length_groups[length_key] = []
                 length_groups[length_key].append((idx, sent))
 
+            current_lr = trainer.param_groups[0]['lr']
+            wandb.log({
+                "train/step": total_processed // new_batch_size,
+                "train/learning_rate": current_lr,
+                "train/batch_size": len(batch_trees)
+            })
             try:
                 total_loss = 0
                 # Process each length group separately
@@ -836,7 +842,17 @@ def run_train(args, hparams):
                 print(f"Sentence lengths: {[len(s) for s in batch_sentences]}")
                 raise e
 
+             # Calculate grad_norm after all backward passes
             grad_norm = torch.nn.utils.clip_grad_norm_(clippable_parameters, grad_clip_threshold)
+                
+            # Log metrics after grad_norm is calculated
+            wandb.log({
+                "train/step": total_processed // new_batch_size,
+                "train/learning_rate": current_lr,
+                "train/batch_size": len(batch_trees),
+                "train/step_loss": batch_loss_value,
+                "train/grad_norm": grad_norm
+            })
             trainer.step()
             
             # Add batch loss to epoch loss
