@@ -21,7 +21,7 @@ RUN apt-get update && \
 RUN git clone https://github.com/pariajm/joint-disfluency-detector-and-parser /app/joint-disfluency-detector-and-parser
 
 # Build evalb using make
-RUN cd /app/EVALB && \
+RUN cd /app/joint-disfluency-detector-and-parser/EVALB && \
     make evalb
 
 # Copy the local directories to the container (src, swbd-data, results, viz, EVALB)
@@ -45,6 +45,8 @@ ENV S3_BUCKET_NAME="com.trebble.ml.training.data"
 # Ensure that PyTorch with CUDA is working correctly (This is a runtime check, not build-time)
 RUN /app/venv/bin/python -c "import torch; print(torch.cuda.is_available())"
 
+RUN cd /app/EVALB && \
+    make evalb
 # Make sure your working directory is correct for running main_improved.py
 WORKDIR /app/src
 
