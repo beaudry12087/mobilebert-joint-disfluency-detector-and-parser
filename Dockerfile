@@ -21,7 +21,7 @@ RUN apt-get update && \
 RUN git clone https://github.com/pariajm/joint-disfluency-detector-and-parser /app/joint-disfluency-detector-and-parser
 
 # Build evalb using make
-RUN cd /app/joint-disfluency-detector-and-parser/EVALB && \
+RUN cd /app/EVALB && \
     make evalb
 
 # Copy the local directories to the container (src, swbd-data, results, viz, EVALB)
