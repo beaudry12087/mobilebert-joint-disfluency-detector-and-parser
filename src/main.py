@@ -135,7 +135,6 @@ def quantize_and_save_model(parser, config, model_path=None):
     """
     Quantize and save model based on configuration parameters
     """
-    # Early exit conditions
     if not config.get("quantization", {}).get("enable", False):
         return
         
@@ -151,7 +150,7 @@ def quantize_and_save_model(parser, config, model_path=None):
         from contextlib import contextmanager
         import time
         import os
-        import wandb  # Add wandb import
+        import wandb
     except ImportError as e:
         print(f"Error: Missing required package - {str(e)}")
         return
@@ -160,7 +159,6 @@ def quantize_and_save_model(parser, config, model_path=None):
     def timeout(seconds):
         def signal_handler(signum, frame):
             raise TimeoutError("Quantization timed out!")
-        
         signal.signal(signal.SIGALRM, signal_handler)
         signal.alarm(seconds)
         try:
@@ -170,20 +168,77 @@ def quantize_and_save_model(parser, config, model_path=None):
     
     print("Converting and quantizing model...")
     
-    class TFMobileBERTWrapper(tf.keras.Model):
-        def __init__(self, config):
-            super(TFMobileBERTWrapper, self).__init__()
+    class TFMobileBERTParser(tf.keras.Model):
+        def __init__(self, pytorch_parser):
+            super(TFMobileBERTParser, self).__init__()
+            # Initialize BERT
             self.bert = TFMobileBertModel.from_pretrained(
                 'google/mobilebert-uncased',
                 from_pt=True,  # Enable PyTorch weight loading
                 output_hidden_states=True
             )
             
+            # Add parsing layers
+            self.span_scorer = tf.keras.layers.Dense(
+                units=pytorch_parser.span_attention.total_output_size,
+                name="span_scorer"
+            )
+            self.edited_scorer = tf.keras.layers.Dense(
+                units=1,
+                name="edited_scorer"
+            )
+            self.filler_scorer = tf.keras.layers.Dense(
+                units=1,
+                name="filler_scorer"
+            )
+            
+            # Copy weights from PyTorch model
+            self._copy_weights(pytorch_parser)
+            
+        def _copy_weights(self, pytorch_parser):
+            # Copy span scorer weights
+            span_weights = pytorch_parser.span_attention.get_weights()
+            self.span_scorer.set_weights([
+                tf.convert_to_tensor(span_weights[0].numpy()),
+                tf.convert_to_tensor(span_weights[1].numpy())
+            ])
+            
+            # Copy edited scorer weights
+            edited_weights = pytorch_parser.edited_scorer.get_weights()
+            self.edited_scorer.set_weights([
+                tf.convert_to_tensor(edited_weights[0].numpy()),
+                tf.convert_to_tensor(edited_weights[1].numpy())
+            ])
+            
+            # Copy filler scorer weights if available
+            if hasattr(pytorch_parser, 'filler_scorer'):
+                filler_weights = pytorch_parser.filler_scorer.get_weights()
+                self.filler_scorer.set_weights([
+                    tf.convert_to_tensor(filler_weights[0].numpy()),
+                    tf.convert_to_tensor(filler_weights[1].numpy())
+                ])
+        
         def call(self, inputs, training=False):
-            return self.bert(inputs, training=training).last_hidden_state
+            # Get BERT embeddings
+            hidden_states = self.bert(inputs, training=training).last_hidden_state
+            
+            # Calculate span scores
+            span_scores = self.span_scorer(hidden_states)
+            
+            # Calculate edited scores
+            edited_scores = self.edited_scorer(hidden_states)
+            
+            # Calculate filler scores
+            filler_scores = self.filler_scorer(hidden_states)
+            
+            return {
+                'span_scores': span_scores,
+                'edited_scores': edited_scores,
+                'filler_scores': filler_scores
+            }
     
-    # Create model with simplified architecture
-    tf_model = TFMobileBERTWrapper({})
+    # Create model with parsing functionality
+    tf_model = TFMobileBERTParser(parser)
     
     # Create sample input and run model once to build
     seq_length = 512
@@ -214,6 +269,7 @@ def quantize_and_save_model(parser, config, model_path=None):
             conversion_time = time.time() - start_time
             print(f"Quantization completed in {conversion_time:.1f} seconds")
             
+            # Save model
             output_path = config.get("output_path", "quantized_model.tflite")
             with open(output_path, 'wb') as f:
                 f.write(tflite_model)

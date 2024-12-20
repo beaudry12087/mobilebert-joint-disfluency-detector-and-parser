@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Disfluency Detection</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-cpu"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite/dist/tf-tflite.min.js"></script>
+</head>
+<body>
+    <h1>Disfluency Detection</h1>
+    <textarea id="input" rows="4" cols="50" placeholder="Enter text to analyze..."></textarea>
+    <br>
+    <button onclick="analyzeSentence()">Analyze Text</button>
+    <div id="results"></div>
+
+    <script>
+        let tfliteModel;
+        const MAX_LENGTH = 512;
+        const PAD_TOKEN = 0;  // Using 0 as padding token
+
+        async function initializeTF() {
+            await tf.setBackend('cpu');
+            console.log('Backend set to:', tf.getBackend());
+            tflite.setWasmPath('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite/dist/');
+        }
+
+        async function loadModel() {
+            try {
+                await initializeTF();
+                tfliteModel = await tflite.loadTFLiteModel(
+                    'https://s3.us-east-1.amazonaws.com/com.trebble.ml.training.data/disfluency-models/quantized_model.tflite',
+                    {
+                        numThreads: navigator.hardwareConcurrency || 4,
+                    }
+                );
+                console.log('Model loaded successfully');
+                document.getElementById('results').innerHTML = 'Model loaded successfully';
+            } catch (error) {
+                console.error('Error loading model:', error);
+                document.getElementById('results').innerHTML = 'Error loading model: ' + error.message;
+            }
+        }
+
+        function padSequence(tokens) {
+            // Truncate if longer than MAX_LENGTH
+            const truncated = tokens.slice(0, MAX_LENGTH);
+            
+            // Pad if shorter than MAX_LENGTH
+            const padding = new Array(MAX_LENGTH - truncated.length).fill(PAD_TOKEN);
+            const padded = truncated.concat(padding);
+            
+            return padded;
+        }
+
+        async function analyzeSentence() {
+            const text = document.getElementById('input').value;
+            const tokens = text.split(' ');
+            
+            try {
+                // Pad the tokens to fixed length
+                const paddedTokens = padSequence(tokens);
+                
+                // Convert tokens to numbers (assuming your model expects token IDs)
+                const tokenIds = paddedTokens.map((token, index) => 
+                    token === PAD_TOKEN ? 0 : index + 1
+                );
+                
+                // Create input tensor with proper shape
+                const inputTensor = tf.tensor2d([tokenIds], [1, MAX_LENGTH], 'int32');
+                
+                console.log('Input tensor shape:', inputTensor.shape);
+                console.log('Input tensor sample:', await inputTensor.data());
+                
+                // Run inference
+                const output = await tfliteModel.predict(inputTensor);
+                
+                // Process results (only for the actual tokens, not padding)
+                const predictions = await output.data();
+                const relevantPredictions = predictions.slice(0, tokens.length);
+                
+                // Display results
+                displayResults(tokens, relevantPredictions);
+                
+                // Cleanup
+                inputTensor.dispose();
+                output.dispose();
+                
+            } catch (error) {
+                console.error('Error during inference:', error);
+                document.getElementById('results').innerHTML = 'Error during inference: ' + error.message;
+            }
+        }
+
+        function displayResults(tokens, predictions) {
+            const resultDiv = document.getElementById('results');
+            const result = tokens.map((token, i) => {
+                const isDisfluency = predictions[i] > 0.5;
+                return isDisfluency ? 
+                    `<span style="background-color: yellow">${token}</span>` : 
+                    token;
+            }).join(' ');
+            
+            resultDiv.innerHTML = `
+                <p><strong>Analysis:</strong></p>
+                <p>${result}</p>
+            `;
+        }
+
+        // Load model when page loads
+        window.onload = loadModel;
+    </script>
+</body>
+</html>
