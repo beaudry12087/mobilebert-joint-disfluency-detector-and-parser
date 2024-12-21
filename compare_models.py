@@ -15,7 +15,7 @@ def compare_models(test_sentences):
     pytorch_parser.eval()
     
     # Load TFLite model
-    interpreter = tf.lite.Interpreter(model_path="modelv5.tflite")
+    interpreter = tf.lite.Interpreter(model_path="modelv8.tflite")
     interpreter.allocate_tensors()
     
     print("\nProcessing sentences...\n")

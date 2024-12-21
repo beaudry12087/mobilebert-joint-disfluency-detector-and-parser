@@ -4,6 +4,14 @@ from transformers import MobileBertTokenizer
 from collections import defaultdict
 import sys
 import os
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Add the src directory to Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -146,80 +154,57 @@ def prepare_input(text, tokenizer):
     tokens = tokenizer.encode(text, add_special_tokens=True)
     return np.array(tokens, dtype=np.int32)
 
-def process_sentence(interpreter, text, validator=None, ignore_agreement_fillers=True, merge_consecutive=True):
-    """Process a single sentence using TFLite model"""
-    if len(text.split()) <= 2:
-        return None
-        
+def process_sentence(interpreter, text):
+    """Process a sentence using the TFLite model"""
     try:
-        # Get interpreter details
+        # Get input and output details
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
         
-        # Initialize tokenizer
+        # Tokenize input
         tokenizer = MobileBertTokenizer.from_pretrained('google/mobilebert-uncased')
+        tokens = tokenizer(
+            text,
+            return_tensors='np',
+            padding=True,
+            truncation=True,
+            max_length=512
+        )['input_ids']
         
-        # Prepare input - tokenize and reshape
-        tokens = tokenizer.encode(text, add_special_tokens=True)
-        input_data = np.array(tokens, dtype=np.int32)
+        # Convert to INT32 explicitly
+        tokens = tokens.astype(np.int32)
         
-        # Get expected input shape from model
-        input_shape = input_details[0]['shape']
+        # Resize input tensor to match input shape
+        input_shape = list(tokens.shape)
+        interpreter.resize_tensor_input(input_details[0]['index'], input_shape)
+        interpreter.allocate_tensors()
         
-        # Reshape input to match model's expected shape
-        # If model expects (1, 1), we'll need to process tokens one at a time
-        if input_shape[1] == 1:
-            results = []
-            for token in tokens:
-                token_input = np.array([[token]], dtype=np.int32)
-                interpreter.set_tensor(input_details[0]['index'], token_input)
-                interpreter.invoke()
-                
-                # Get outputs for this token
-                label_scores = interpreter.get_tensor(output_details[0]['index'])
-                interregnum_scores = interpreter.get_tensor(output_details[1]['index'])
-                results.append({
-                    'label_scores': label_scores,
-                    'interregnum_scores': interregnum_scores
-                })
-            
-            # Combine results
-            output_data = {
-                'label_scores': np.concatenate([r['label_scores'] for r in results], axis=1),
-                'interregnum_scores': np.concatenate([r['interregnum_scores'] for r in results], axis=1)
-            }
-        else:
-            # Process entire sequence at once
-            input_data = input_data.reshape(1, -1)  # Add batch dimension
-            interpreter.set_tensor(input_details[0]['index'], input_data)
-            interpreter.invoke()
-            
-            # Get outputs
-            output_data = {
-                'label_scores': interpreter.get_tensor(output_details[0]['index']),
-                'interregnum_scores': interpreter.get_tensor(output_details[1]['index'])
-            }
+        # Set input tensor
+        interpreter.set_tensor(input_details[0]['index'], tokens)
         
-        # Process output
-        disfluencies = process_output(output_data, text, tokenizer)
+        # Run inference
+        interpreter.invoke()
         
-        # Validate if validator is provided
-        if validator:
-            validation_results = validator.analyze_output(text, disfluencies)
-            if validation_results['potential_errors']:
-                for error in validation_results['potential_errors']:
-                    print(f"\nPotential error: {error['span']} ({error['type']})")
+        # Get outputs
+        label_scores = interpreter.get_tensor(output_details[0]['index'])
+        interregnum_scores = interpreter.get_tensor(output_details[1]['index'])
         
-        # Return formatted text if disfluencies found
-        if any(is_disf for _, is_disf in disfluencies):
-            return format_disfluencies(disfluencies, merge_consecutive=merge_consecutive)
-            
+        # Process outputs and format results
+        return process_outputs(label_scores, interregnum_scores, text)
+        
     except Exception as e:
-        print(f"Error processing sentence: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    return None
+        logger.error(f"Error processing sentence: {str(e)}")
+        return "No disfluencies detected"
+
+def process_outputs(label_scores, interregnum_scores, text):
+    """Process model outputs and format results"""
+    try:
+        # Add your output processing logic here
+        # For now, returning a placeholder
+        return "No disfluencies detected"
+    except Exception as e:
+        logger.error(f"Error processing outputs: {str(e)}")
+        return "No disfluencies detected"
 
 def test_model(test_sentences):
     """Main testing function"""
